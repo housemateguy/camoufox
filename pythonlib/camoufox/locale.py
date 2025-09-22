@@ -1,8 +1,20 @@
 import xml.etree.ElementTree as ET  # nosec
+from bisect import bisect_left
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union, cast
-
-import numpy as np
+from random import random
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+    cast,
+)
 from language_tags import tags
 
 from camoufox.pkgman import LOCAL_DATA, GitHubDownloader, rprint, webdl
@@ -31,7 +43,7 @@ Data structures for locale and geolocation info
 """
 
 
-@dataclass
+@dataclass(slots=True)
 class Locale:
     """
     Stores locale, region, and script information.
@@ -61,7 +73,7 @@ class Locale:
         return data
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Geolocation:
     """
     Stores geolocation information.
@@ -86,6 +98,20 @@ class Geolocation:
         if self.accuracy:
             data['geolocation:accuracy'] = self.accuracy
         return data
+
+
+class ProbabilityTable(NamedTuple):
+    values: Tuple[str, ...]
+    cumulative: Tuple[float, ...]
+
+
+def _sample_probability(table: ProbabilityTable) -> str:
+    """Select a value from a cumulative distribution."""
+
+    idx = bisect_left(table.cumulative, random())
+    if idx >= len(table.values):
+        return table.values[-1]
+    return table.values[idx]
 
 
 """
@@ -306,77 +332,142 @@ class StatisticalLocaleSelector:
     Takes either a territory code or a language code, and generates a Locale object.
     """
 
-    def __init__(self):
-        self.root = get_unicode_info()
+    __slots__ = (
+        "_territory_languages",
+        "_language_regions",
+        "_known_territories",
+        "_known_languages",
+    )
 
-    def _load_territory_data(self, iso_code: str) -> Tuple[np.ndarray, np.ndarray]:
+    def __init__(self):
+        root = get_unicode_info()
+        territory_lookup: Dict[str, ProbabilityTable] = {}
+        language_lookup: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+        known_languages: Set[str] = set()
+        known_territories: Set[str] = set()
+
+        for territory in root.findall("territory"):
+            iso_code = territory.get("type")
+            if not iso_code:
+                continue
+
+            known_territories.add(iso_code)
+
+            lang_populations = territory.findall("languagePopulation")
+            languages: List[str] = []
+            percentages: List[float] = []
+
+            literacy = _as_float(territory, "literacyPercent")
+            population = _as_float(territory, "population")
+
+            for lang in lang_populations:
+                lang_type = lang.get("type")
+                if not lang_type:
+                    continue
+
+                known_languages.add(lang_type)
+
+                population_percent = _as_float(lang, "populationPercent")
+                if population_percent <= 0:
+                    continue
+
+                languages.append(lang_type)
+                percentages.append(population_percent)
+                language_lookup[lang_type].append(
+                    (
+                        iso_code,
+                        population_percent * literacy / 10_000 * population,
+                    )
+                )
+
+            if languages:
+                territory_lookup[iso_code] = self.normalize_probabilities(
+                    languages, percentages
+                )
+
+        language_tables: Dict[str, ProbabilityTable] = {}
+        for lang_type, entries in language_lookup.items():
+            regions = [region for region, _ in entries]
+            weights = [weight for _, weight in entries]
+            try:
+                language_tables[lang_type] = self.normalize_probabilities(
+                    regions, weights
+                )
+            except ValueError:
+                continue
+
+        self._territory_languages = territory_lookup
+        self._language_regions = language_tables
+        self._known_territories = known_territories
+        self._known_languages = known_languages
+
+    def _load_territory_data(self, iso_code: str) -> ProbabilityTable:
         """
         Calculates a random language based on the territory code,
         based on the probability that a person speaks the language in the territory.
         """
-        territory = self.root.find(f"territory[@type='{iso_code}']")
-        if territory is None:
+        if iso_code not in self._known_territories:
             raise UnknownTerritory(f"Unknown territory: {iso_code}")
 
-        lang_populations = territory.findall('languagePopulation')
-        if not lang_populations:
-            raise ValueError(f"No language data found for region: {iso_code}")
+        try:
+            return self._territory_languages[iso_code]
+        except KeyError as exc:
+            raise ValueError(f"No language data found for region: {iso_code}") from exc
 
-        languages = np.array([lang.get('type') for lang in lang_populations])
-        percentages = np.array([_as_float(lang, 'populationPercent') for lang in lang_populations])
-
-        return self.normalize_probabilities(languages, percentages)
-
-    def _load_language_data(self, language: str) -> Tuple[np.ndarray, np.ndarray]:
+    def _load_language_data(self, language: str) -> ProbabilityTable:
         """
         Calculates a random region for a language
         based on the total speakers of the language in that region.
         """
-        territories = self.root.findall(f'.//territory/languagePopulation[@type="{language}"]/..')
-        if not territories:
+        if language not in self._known_languages:
             raise UnknownLanguage(f"No region data found for language: {language}")
 
-        regions = []
-        percentages = []
-
-        for terr in territories:
-            region = terr.get('type')
-            if region is None:
-                continue  # Skip if region is not found
-
-            lang_pop = terr.find(f'languagePopulation[@type="{language}"]')
-            if lang_pop is None:
-                continue  # This shouldn't happen due to our XPath, but just in case
-
-            regions.append(region)
-            percentages.append(
-                _as_float(lang_pop, 'populationPercent')
-                * _as_float(terr, 'literacyPercent')
-                / 10_000
-                * _as_float(terr, 'population')
-            )
-
-        if not regions:
-            raise ValueError(f"No valid region data found for language: {language}")
-
-        return self.normalize_probabilities(np.array(regions), np.array(percentages))
+        try:
+            return self._language_regions[language]
+        except KeyError as exc:
+            raise ValueError(
+                f"No valid region data found for language: {language}"
+            ) from exc
 
     def normalize_probabilities(
-        self, languages: np.ndarray, freq: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        self, values: Iterable[str], freq: Iterable[float]
+    ) -> ProbabilityTable:
         """
         Normalize probabilities.
         """
-        total = np.sum(freq)
-        return languages, freq / total
+        paired = [
+            (value, weight)
+            for value, weight in zip(values, freq)
+            if weight > 0
+        ]
+        if not paired:
+            raise ValueError('No positive probability values provided')
+
+        total = sum(weight for _, weight in paired)
+        if total <= 0:
+            raise ValueError('Probability weights must sum to a positive value')
+
+        inv_total = 1.0 / total
+        cumulative: List[float] = []
+        normalized_values: List[str] = []
+        running = 0.0
+
+        for value, weight in paired:
+            running += weight * inv_total
+            normalized_values.append(value)
+            cumulative.append(running)
+
+        cumulative[-1] = 1.0  # Guard against floating point drift
+
+        return ProbabilityTable(tuple(normalized_values), tuple(cumulative))
 
     def from_region(self, region: str) -> Locale:
         """
         Get a random locale based on the territory ISO code.
         Returns as a Locale object.
         """
-        languages, probabilities = self._load_territory_data(region)
-        language = np.random.choice(languages, p=probabilities).replace('_', '-')
+        distribution = self._load_territory_data(region)
+        language = _sample_probability(distribution).replace('_', '-')
         return normalize_locale(f"{language}-{region}")
 
     def from_language(self, language: str) -> Locale:
@@ -384,8 +475,8 @@ class StatisticalLocaleSelector:
         Get a random locale based on the language.
         Returns as a Locale object.
         """
-        regions, probabilities = self._load_language_data(language)
-        region = np.random.choice(regions, p=probabilities)
+        distribution = self._load_language_data(language)
+        region = _sample_probability(distribution)
         return normalize_locale(f"{language}-{region}")
 
 

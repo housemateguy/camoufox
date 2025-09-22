@@ -1,5 +1,6 @@
 import os
 import sys
+from functools import lru_cache
 from os import environ
 from os.path import abspath
 from pathlib import Path
@@ -7,7 +8,6 @@ from pprint import pprint
 from random import randint, randrange
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, cast
 
-import numpy as np
 import orjson
 from browserforge.fingerprints import Fingerprint, Screen
 from screeninfo import get_monitors
@@ -171,18 +171,41 @@ def get_screen_cons(headless: Optional[bool] = None) -> Optional[Screen]:
     return Screen(max_width=monitor.width, max_height=monitor.height)
 
 
+@lru_cache(maxsize=1)
+def _load_fonts_by_os() -> Dict[str, List[str]]:
+    """Load the bundled fonts file once and cache the result."""
+
+    fonts_path = os.path.join(os.path.dirname(__file__), "fonts.json")
+    with open(fonts_path, "rb") as f:
+        raw_fonts = orjson.loads(f.read())
+    return {key: list(value) for key, value in raw_fonts.items()}
+
+
+def _merge_font_lists(default_fonts: List[str], extra_fonts: List[str]) -> List[str]:
+    """Merge two font lists while preserving order and removing duplicates."""
+
+    seen = set()
+    merged: List[str] = []
+    for font in [*default_fonts, *extra_fonts]:
+        if font not in seen:
+            seen.add(font)
+            merged.append(font)
+    return merged
+
+
 def update_fonts(config: Dict[str, Any], target_os: str) -> None:
     """
     Updates the fonts for the target OS.
     """
-    with open(os.path.join(os.path.dirname(__file__), "fonts.json"), "rb") as f:
-        fonts = orjson.loads(f.read())[target_os]
 
-    # Merge with existing fonts
-    if 'fonts' in config:
-        config['fonts'] = np.unique(fonts + config['fonts']).tolist()
+    fonts_by_os = _load_fonts_by_os()
+    fonts = fonts_by_os.get(target_os, [])
+
+    existing_fonts = config.get('fonts')
+    if existing_fonts:
+        config['fonts'] = _merge_font_lists(fonts, list(existing_fonts))
     else:
-        config['fonts'] = fonts
+        config['fonts'] = list(fonts)
 
 
 def check_custom_fingerprint(fingerprint: Fingerprint) -> None:
